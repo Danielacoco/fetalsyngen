@@ -178,5 +178,6 @@ dependencies:
       - pyparsing==3.2.1
       - scikit-learn==1.6.1
       - threadpoolctl==3.5.0
+      - torchio>=0.20,<0.21
       - tqdm==4.67.1
 prefix: /home/vzalevskyi/miniconda3/envs/fetalsyngen
