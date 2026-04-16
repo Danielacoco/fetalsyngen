@@ -13,6 +13,7 @@ import torch
 import numpy as np
 from monai.data import MetaTensor
 import torchio as tio
+import pandas as pd
 
 
 class FetalDataset:
@@ -493,6 +494,211 @@ class FetalSynthDataset(FetalDataset):
 
         data, generation_params = self.sample(idx, genparams=genparams)
         data["generation_params"] = generation_params
+        return data
+
+
+class MultiProtocolDataset:
+    """Composes multiple :class:`FetalDataset` instances and returns training
+    samples tagged with a protocol conditioning vector for CoNeMOS-style FiLM
+    conditioning.
+
+    Each dataset entry is associated with a named annotation protocol
+    (e.g. ``"dHCP_drawem9"`` or ``"FeTa"``).  Segmentation labels are remapped
+    from their raw dataset-specific integers to a shared set of output channels
+    defined by ``label_map_csv``.
+
+    Args:
+        dataset_entries: List of dicts, each with keys:
+            - ``bids_path`` (str): Path to the BIDS folder.
+            - ``split_file`` (str): Path to a CSV with columns
+              ``participant_id`` and ``splits``.
+            - ``protocol_name`` (str): Annotation protocol name.
+        split: Split to load (e.g. ``"train"``).  Rows in each split CSV
+            where ``splits == split`` are kept.
+        label_map_csv: Path to a CSV with columns ``protocol``,
+            ``raw_label`` (int), ``channel`` (int).  Defines how raw
+            segmentation integers map to output channel indices per protocol.
+        img_suffix: Image file suffix (default ``"T2w"``).
+        seg_suffix: Segmentation file suffix (default ``"dseg"``).
+        transforms: Optional MONAI :class:`~monai.transforms.Compose` applied
+            to each sample after loading and remapping.
+    """
+
+    def __init__(
+        self,
+        dataset_entries: list[dict],
+        label_map_csv: str,
+        img_suffix: str = "T2w",
+        seg_suffix: str = "dseg",
+        transforms: Compose | None = None,
+    ):
+
+        label_df = pd.read_csv(label_map_csv)
+        for col in ("protocol", "raw_label", "channel"):
+            if col not in label_df.columns:
+                raise ValueError(
+                    f"label_map_csv is missing required column '{col}'. "
+                    f"Found: {label_df.columns.tolist()}"
+                )
+
+        self.transforms = transforms
+
+        # protocol_registry: protocol_name -> integer index (first-seen order)
+        self.protocol_registry: dict[str, int] = {}
+
+        self._datasets: list[FetalDataset] = []
+        # per-dataset label remap: raw_label_int -> channel_int
+        self._label_maps: list[dict[int, int]] = []
+        # per-dataset protocol one-hot tensor (built after all protocols seen)
+        self._protocol_names: list[str] = []
+        # per-dataset train type: "synth" or "real"
+        self._train_types: list[str] = []
+        # per-dataset flag: True means FetalTestDataset (no generator)
+        self._is_test: list[bool] = []
+
+        self.sample_index: list[tuple[int, int]] = []
+
+        for ds_idx, entry in enumerate(dataset_entries):
+            bids_path = entry["bids_path"]
+            sub_list = entry["sub_list"]
+            protocol_name = entry["protocol_name"]
+            is_test = entry.get("is_test", False)
+            train_type = entry.get("train_type", "real")
+            assert train_type in ("synth", "real"), (
+                f"train_type must be 'synth' or 'real', got '{train_type}'"
+            )
+            self._train_types.append(train_type)
+            self._is_test.append(is_test)
+
+            # Register protocol
+            if protocol_name not in self.protocol_registry:
+                self.protocol_registry[protocol_name] = len(self.protocol_registry)
+            self._protocol_names.append(protocol_name)
+
+            if is_test:
+                ds = FetalTestDataset(
+                    bids_path=bids_path,
+                    sub_list=sub_list,
+                    transforms=self.transforms,
+                    img_suffix=img_suffix,
+                    seg_suffix=seg_suffix,
+                )
+            elif train_type == "synth":
+                if "generator" not in entry:
+                    raise ValueError(
+                        f"Entry for protocol '{protocol_name}' has train_type='synth' "
+                        "but is missing required key 'generator'."
+                    )
+                ds = FetalSynthDataset(
+                    bids_path=bids_path,
+                    seed_path=entry.get("seed_path", None),
+                    sub_list=sub_list,
+                    load_image=False,
+                    image_as_intensity=False,
+                    generator=entry["generator"],
+                    img_suffix=img_suffix,
+                    seg_suffix=seg_suffix,
+                    apply_mri_augm=entry.get("apply_mri_augm", False),
+                )
+            else:
+                # train_type="real": real images through FetalSynthDataset
+                # (load_image=True, image_as_intensity=True) so spatial deformation
+                # and augmentation still apply, consistent with original DataModule
+                ds = FetalSynthDataset(
+                    bids_path=bids_path,
+                    seed_path=None,
+                    sub_list=sub_list,
+                    load_image=True,
+                    image_as_intensity=True,
+                    generator=entry.get("generator", None),
+                    img_suffix=img_suffix,
+                    seg_suffix=seg_suffix,
+                    apply_mri_augm=entry.get("apply_mri_augm", False),
+                )
+            self._datasets.append(ds)
+
+            # Build label remap for this protocol
+            proto_rows = label_df[label_df["protocol"] == protocol_name]
+            label_map: dict[int, int] = {
+                int(r["raw_label"]): int(r["channel"])
+                for _, r in proto_rows.iterrows()
+            }
+            self._label_maps.append(label_map)
+
+            # Extend flat sample index
+            for local_idx in range(len(ds)):
+                self.sample_index.append((ds_idx, local_idx))
+
+        # Build one-hot tensors now that all protocols are registered
+        num_protocols = len(self.protocol_registry)
+        self._protocol_vecs: list[torch.Tensor] = []
+        for name in self._protocol_names:
+            vec = torch.zeros(num_protocols, dtype=torch.float32)
+            vec[self.protocol_registry[name]] = 1.0
+            self._protocol_vecs.append(vec)
+
+        # Number of output channels = max channel index across all label maps + 1
+        # Exposed so the model can be instantiated with the correct output size.
+        all_channels = [c for lm in self._label_maps for c in lm.values()]
+        self.num_channels: int = max(all_channels) + 1 if all_channels else 0
+
+        self._scaler = ScaleIntensity(minv=0, maxv=1)
+        self._orientation = Orientation(axcodes="RAS")
+
+    def __len__(self) -> int:
+        return len(self.sample_index)
+
+    def __getitem__(self, idx: int) -> dict:
+        """Return a training sample with protocol conditioning.
+
+        Returns:
+            Dictionary with keys:
+
+            - ``"image"``: ``torch.float32`` tensor ``(1, H, W, D)``.
+            - ``"label"``: ``torch.long`` tensor ``(1, H, W, D)`` with
+              channel indices from ``label_map_csv`` (unmapped labels → 0).
+            - ``"protocol_vec"``: ``torch.float32`` one-hot tensor of length
+              ``num_protocols``.
+            - ``"protocol_name"``: str.
+            - ``"name"``: str in ``sub_ses`` (or just ``sub``) format.
+        """
+        ds_idx, local_idx = self.sample_index[idx]
+        ds = self._datasets[ds_idx]
+
+        if self._is_test[ds_idx] or self._train_types[ds_idx] == "real":
+            # FetalTestDataset or FetalSynthDataset(real mode):
+            # delegate entirely to ds[local_idx] — orientation, scaling,
+            # and any transforms are handled inside the dataset.
+            data_out = ds[local_idx]
+            image = data_out["image"]
+            segm = data_out["label"]
+            name = data_out["name"]
+        else:
+            # train_type="synth": use sample() to get image + raw label integers.
+            # FetalSynthDataset.sample() handles orientation, scaling, augmentation.
+            data_out, _ = ds.sample(local_idx)
+            image = data_out["image"]
+            segm = data_out["label"]
+            name = data_out["name"]
+
+        # Remap segmentation labels to shared output channels
+        label_map = self._label_maps[ds_idx]
+        remapped = torch.zeros_like(segm, dtype=torch.long)
+        for raw_val, channel in label_map.items():
+            remapped[segm == raw_val] = channel
+        segm = remapped
+
+        data = {
+            "image": image.float(),
+            "label": segm.long(),
+            "protocol_vec": self._protocol_vecs[ds_idx],
+            "protocol_name": self._protocol_names[ds_idx],
+            "name": name,
+        }
+
+        if self.transforms is not None:
+            data = self.transforms(data)
+
         return data
 
 
