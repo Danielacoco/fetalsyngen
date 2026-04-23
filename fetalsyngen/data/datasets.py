@@ -498,12 +498,12 @@ class FetalSynthDataset(FetalDataset):
 
 
 class MultiProtocolDataset:
-    """Composes multiple :class:`FetalDataset` instances and returns training
+    """Composes multiple `FetalDataset` instances and returns training
     samples tagged with a protocol conditioning vector for CoNeMOS-style FiLM
     conditioning.
 
     Each dataset entry is associated with a named annotation protocol
-    (e.g. ``"dHCP_drawem9"`` or ``"FeTa"``).  Segmentation labels are remapped
+    (e.g. ``"drawem9_albert"`` or ``"feta"``).  Segmentation labels are remapped
     from their raw dataset-specific integers to a shared set of output channels
     defined by ``label_map_csv``.
 
@@ -518,10 +518,16 @@ class MultiProtocolDataset:
         label_map_csv: Path to a CSV with columns ``protocol``,
             ``raw_label`` (int), ``channel`` (int).  Defines how raw
             segmentation integers map to output channel indices per protocol.
-        img_suffix: Image file suffix (default ``"T2w"``).
-        seg_suffix: Segmentation file suffix (default ``"dseg"``).
+        img_suffix: Default image file suffix used when an entry does not
+            specify ``"img_suffix"`` (default ``"T2w"``).
+        seg_suffix: Default segmentation file suffix used when an entry does
+            not specify ``"seg_suffix"`` (default ``"dseg"``).
         transforms: Optional MONAI :class:`~monai.transforms.Compose` applied
             to each sample after loading and remapping.
+
+    Per-entry suffix override
+        Add ``"img_suffix"`` or ``"seg_suffix"`` keys to any entry dict to
+        override the defaults for that dataset only.
     """
 
     def __init__(
@@ -564,6 +570,8 @@ class MultiProtocolDataset:
             protocol_name = entry["protocol_name"]
             is_test = entry.get("is_test", False)
             train_type = entry.get("train_type", "real")
+            entry_img_suffix = entry.get("img_suffix", img_suffix)
+            entry_seg_suffix = entry.get("seg_suffix", seg_suffix)
             assert train_type in ("synth", "real"), (
                 f"train_type must be 'synth' or 'real', got '{train_type}'"
             )
@@ -580,8 +588,8 @@ class MultiProtocolDataset:
                     bids_path=bids_path,
                     sub_list=sub_list,
                     transforms=self.transforms,
-                    img_suffix=img_suffix,
-                    seg_suffix=seg_suffix,
+                    img_suffix=entry_img_suffix,
+                    seg_suffix=entry_seg_suffix,
                 )
             elif train_type == "synth":
                 if "generator" not in entry:
@@ -596,23 +604,29 @@ class MultiProtocolDataset:
                     load_image=False,
                     image_as_intensity=False,
                     generator=entry["generator"],
-                    img_suffix=img_suffix,
-                    seg_suffix=seg_suffix,
+                    img_suffix=entry_img_suffix,
+                    seg_suffix=entry_seg_suffix,
                     apply_mri_augm=entry.get("apply_mri_augm", False),
                 )
             else:
                 # train_type="real": real images through FetalSynthDataset
                 # (load_image=True, image_as_intensity=True) so spatial deformation
-                # and augmentation still apply, consistent with original DataModule
+                # still applies, consistent with original DataModule.
+                if entry.get("generator") is None:
+                    raise ValueError(
+                        f"Entry for protocol '{protocol_name}' has train_type='real' "
+                        "but is missing required key 'generator'. Pass a generator "
+                        "(with augmentations nulled out if needed) as in the existing experiments."
+                    )
                 ds = FetalSynthDataset(
                     bids_path=bids_path,
                     seed_path=None,
                     sub_list=sub_list,
                     load_image=True,
                     image_as_intensity=True,
-                    generator=entry.get("generator", None),
-                    img_suffix=img_suffix,
-                    seg_suffix=seg_suffix,
+                    generator=entry["generator"],
+                    img_suffix=entry_img_suffix,
+                    seg_suffix=entry_seg_suffix,
                     apply_mri_augm=entry.get("apply_mri_augm", False),
                 )
             self._datasets.append(ds)
