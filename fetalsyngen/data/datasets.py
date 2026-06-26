@@ -122,7 +122,7 @@ class FetalDataset:
         if ses is None:
             return f"{sub}/anat/{sub}*_{suffix}{extension}"
         else:
-            return f"{sub}/{ses}/anat/{sub}_{ses}*_{suffix}{extension}"
+            return f"{sub}/{ses}/anat/{sub}*_{suffix}{extension}"
 
     def _load_bids_path(self, path, suffix):
         """
@@ -555,6 +555,7 @@ class MultiProtocolDataset:
         self._datasets: list[FetalDataset] = []
         # per-dataset label remap: raw_label_int -> channel_int
         self._label_maps: list[dict[int, int]] = []
+        self._label_luts: list[torch.Tensor] = []
         # per-dataset protocol one-hot tensor (built after all protocols seen)
         self._protocol_names: list[str] = []
         # per-dataset train type: "synth" or "real"
@@ -639,6 +640,15 @@ class MultiProtocolDataset:
             }
             self._label_maps.append(label_map)
 
+            # Build LUT for vectorised remapping in __getitem__.
+            # size256 covers all uint8 label values
+            # any wild value not in label_map stays 0 (background), matching
+            # the original zeros_like behaviour.
+            lut = torch.zeros(256, dtype=torch.long)
+            for raw_val, channel in label_map.items():
+                lut[raw_val] = channel
+            self._label_luts.append(lut)
+
             # Extend flat sample index
             for local_idx in range(len(ds)):
                 self.sample_index.append((ds_idx, local_idx))
@@ -695,12 +705,10 @@ class MultiProtocolDataset:
             segm = data_out["label"]
             name = data_out["name"]
 
-        # Remap segmentation labels to shared output channels
-        label_map = self._label_maps[ds_idx]
-        remapped = torch.zeros_like(segm, dtype=torch.long)
-        for raw_val, channel in label_map.items():
-            remapped[segm == raw_val] = channel
-        segm = remapped
+        # Remap segmentation labels to shared output channels via prebuilt LUT.
+        # Values outside the LUT range (not in label_map) clamp to 0 = background.
+        lut = self._label_luts[ds_idx]
+        segm = lut[segm.clamp(min=0, max=255)]
 
         data = {
             "image": image.float(),
